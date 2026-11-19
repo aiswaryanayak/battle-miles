@@ -40,3 +40,10 @@ export function requireAdmin(req: AuthenticatedRequest, res: Response, next: Nex
   }
   return next();
 }
+
+export function requireParticipant(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  if (req.authUser?.role !== 'participant') {
+    return res.status(403).json({ message: 'Participant access required' });
+  }
+  return next();
+}

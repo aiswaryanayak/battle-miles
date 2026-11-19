@@ -23,19 +23,27 @@ const suite = describe('authentication integration', () => {
   const runId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const participantEmail = `runner-${runId}@example.com`;
   const adminEmail = `admin-${runId}@example.com`;
+  const otherParticipantEmail = `other-${runId}@example.com`;
   let app: typeof import('./server').app;
   let closeSessionStore: typeof import('./server').closeSessionStore;
   let connectDatabase: typeof import('./config/db').connectDatabase;
   let disconnectDatabase: typeof import('./config/db').disconnectDatabase;
   let User: typeof import('./models').User;
+  let Registration: typeof import('./models').Registration;
   let server: http.Server;
   let baseUrl: string;
   let participantId: string | undefined;
   let adminId: string | undefined;
+  let otherParticipantId: string | undefined;
+  let otherRegistrationId: string | undefined;
 
   async function request(path: string, init: RequestInit = {}): Promise<{ response: Response; body: Record<string, unknown> }> {
     const response = await fetch(`${baseUrl}${path}`, init);
     return { response, body: await response.json() as Record<string, unknown> };
+  }
+
+  function cookieHeader(setCookie: string): string {
+    return setCookie.split(';', 1)[0];
   }
 
   async function getSessionIdsForUsers(userIds: string[]): Promise<string[]> {
@@ -59,7 +67,7 @@ const suite = describe('authentication integration', () => {
     process.env.FRONTEND_ORIGIN = 'http://localhost:3000';
     ({ app, closeSessionStore } = await import('./server'));
     ({ connectDatabase, disconnectDatabase } = await import('./config/db'));
-    ({ User } = await import('./models'));
+    ({ User, Registration } = await import('./models'));
     await connectDatabase();
     server = app.listen(0);
     await new Promise<void>(resolve => server.once('listening', () => resolve()));
@@ -69,9 +77,12 @@ const suite = describe('authentication integration', () => {
   });
 
   after(async () => {
-    const userIds = [participantId, adminId].filter((id): id is string => Boolean(id));
+    const userIds = [participantId, adminId, otherParticipantId].filter((id): id is string => Boolean(id));
     if (userIds.length > 0) {
-      await User.deleteMany({ email: { $in: [participantEmail, adminEmail] } });
+      await Registration.deleteMany({
+        userId: { $in: userIds.map(id => new mongoose.Types.ObjectId(id)) }
+      });
+      await User.deleteMany({ email: { $in: [participantEmail, adminEmail, otherParticipantEmail] } });
       const sessionIds = await getSessionIdsForUsers(userIds);
       if (sessionIds.length > 0) {
         await mongoose.connection.collection<{ _id: string; session: string }>('sessions').deleteMany({
@@ -124,6 +135,25 @@ const suite = describe('authentication integration', () => {
   it('authenticates, returns a safe user, and destroys logout sessions', async () => {
     const unauthenticated = await request('/auth/me');
     assert.equal(unauthenticated.response.status, 401);
+
+    const loginForValidation = await request('/auth/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: participantEmail, password: 'StrongPassword123!' })
+    });
+    assert.equal(loginForValidation.response.status, 200);
+    const validationSetCookie = loginForValidation.response.headers.get('set-cookie');
+    assert(validationSetCookie);
+    const validationCookie = cookieHeader(validationSetCookie);
+    const missingKey = await request('/registrations', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: validationCookie },
+      body: JSON.stringify({
+        distancePackage: '05',
+        address: { line1: '1 Test Road', city: 'Test City', state: 'Test State', pincode: '12345' }
+      })
+    });
+    assert.equal(missingKey.response.status, 400);
     const wrongPassword = await request('/auth/login', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -152,6 +182,169 @@ const suite = describe('authentication integration', () => {
     assert.equal(logout.response.status, 200);
     const afterLogout = await request('/auth/me', { headers: { cookie } });
     assert.equal(afterLogout.response.status, 401);
+  });
+
+  it('creates protected, idempotent, multi-registration records', async () => {
+    const unauthenticated = await request('/registrations', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'Idempotency-Key': `unauth-${runId}-0001`
+      },
+      body: JSON.stringify({
+        distancePackage: '05',
+        address: { line1: '1 Test Road', city: 'Test City', state: 'Test State', pincode: '12345' }
+      })
+    });
+    assert.equal(unauthenticated.response.status, 401);
+
+    const login = await request('/auth/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: participantEmail, password: 'StrongPassword123!' })
+    });
+    assert.equal(login.response.status, 200);
+    const setCookie = login.response.headers.get('set-cookie');
+    assert(setCookie);
+    const cookie = cookieHeader(setCookie);
+
+    const invalidDistance = await request('/registrations', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'Idempotency-Key': `invalid-distance-${runId}`, cookie },
+      body: JSON.stringify({
+        distancePackage: '42',
+        address: { line1: '1 Test Road', city: 'Test City', state: 'Test State', pincode: '12345' }
+      })
+    });
+    assert.equal(invalidDistance.response.status, 400);
+
+    const invalidAddress = await request('/registrations', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'Idempotency-Key': `invalid-address-${runId}`, cookie },
+      body: JSON.stringify({
+        distancePackage: '05',
+        address: { line1: '', city: 'Test City', state: 'Test State', pincode: '' }
+      })
+    });
+    assert.equal(invalidAddress.response.status, 400);
+
+    const unknownFields = await request('/registrations', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'Idempotency-Key': `unknown-fields-${runId}`, cookie },
+      body: JSON.stringify({
+        distancePackage: '05',
+        amountPaise: 1,
+        userId: '507f1f77bcf86cd799439011',
+        address: { line1: '1 Test Road', city: 'Test City', state: 'Test State', pincode: '12345' }
+      })
+    });
+    assert.equal(unknownFields.response.status, 400);
+
+    const firstKey = `first-reg-${runId}-0001`;
+    const first = await request('/registrations', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'Idempotency-Key': firstKey, cookie },
+      body: JSON.stringify({
+        distancePackage: '05',
+        address: { line1: '1 Test Road', city: 'Test City', state: 'Test State', pincode: '12345' }
+      })
+    });
+    assert.equal(first.response.status, 201);
+    const firstRegistration = (first.body.registration as Record<string, unknown>);
+    assert.equal(firstRegistration.amountPaise, 80000);
+    assert.equal(firstRegistration.currency, 'INR');
+    assert.equal(firstRegistration.paymentStatus, 'pending');
+    assert.equal(firstRegistration.status, 'pending_payment');
+    assert.equal(firstRegistration.kitEligible, undefined);
+    assert.equal(firstRegistration.eligibleDistance, undefined);
+
+    const secondKey = `second-reg-${runId}-0002`;
+    const second = await request('/registrations', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'Idempotency-Key': secondKey, cookie },
+      body: JSON.stringify({
+        distancePackage: '10',
+        address: { line1: '2 Test Road', city: 'Test City', state: 'Test State', pincode: '23456' }
+      })
+    });
+    assert.equal(second.response.status, 201);
+    const secondRegistration = (second.body.registration as Record<string, unknown>);
+    assert.equal(secondRegistration.amountPaise, 120000);
+    assert.deepEqual(secondRegistration.inclusions, ['medal', 'runner_badge', 'refreshment_pack']);
+
+    const sameDistanceKey = `same-distance-${runId}-0003`;
+    const sameDistance = await request('/registrations', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'Idempotency-Key': sameDistanceKey, cookie },
+      body: JSON.stringify({
+        distancePackage: '05',
+        address: { line1: '3 Test Road', city: 'Test City', state: 'Test State', pincode: '34567' }
+      })
+    });
+    assert.equal(sameDistance.response.status, 201);
+
+    const repeated = await request('/registrations', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'Idempotency-Key': firstKey, cookie },
+      body: JSON.stringify({
+        distancePackage: '05',
+        address: { line1: '1 Test Road', city: 'Test City', state: 'Test State', pincode: '12345' }
+      })
+    });
+    assert.equal(repeated.response.status, 200);
+    assert.equal((repeated.body.registration as Record<string, unknown>).id, firstRegistration.id);
+
+    const concurrentKey = `concurrent-${runId}-0004`;
+    const concurrentBody = JSON.stringify({
+      distancePackage: '20',
+      address: { line1: '4 Test Road', city: 'Test City', state: 'Test State', pincode: '45678' }
+    });
+    const concurrent = await Promise.all([1, 2].map(() => request('/registrations', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'Idempotency-Key': concurrentKey, cookie },
+      body: concurrentBody
+    })));
+    assert.deepEqual(concurrent.map(result => result.response.status).sort(), [200, 201]);
+    assert.equal((concurrent[0].body.registration as Record<string, unknown>).id,
+      (concurrent[1].body.registration as Record<string, unknown>).id);
+    const concurrentRegistration = concurrent[0].body.registration as Record<string, unknown>;
+    assert.equal(concurrentRegistration.amountPaise, 150000);
+    assert.deepEqual(concurrentRegistration.inclusions, ['medal', 'runner_badge', 'event_tshirt']);
+
+    const me = await request('/registrations/me', { headers: { cookie } });
+    assert.equal(me.response.status, 200);
+    const registrations = me.body.registrations as Record<string, unknown>[];
+    assert.equal(registrations.length, 4);
+    assert(registrations.every(registration => String(registration.paymentStatus) === 'pending'));
+    assert(registrations.every(registration => !('kitEligible' in registration)));
+    assert(registrations.every(registration => !('eligibleDistance' in registration)));
+
+    const passwordHash = await argon2.hash('OtherPassword123!', { type: argon2.argon2id });
+    const other = await User.create({
+      name: 'Other Runner',
+      email: otherParticipantEmail,
+      passwordHash,
+      phone: '1234567890',
+      role: 'participant'
+    });
+    otherParticipantId = other.id;
+    const otherRegistration = await Registration.create({
+      userId: other._id,
+      idempotencyKey: `other-owner-${runId}-0005`,
+      distancePackage: '05',
+      amountPaise: 80000,
+      currency: 'INR',
+      paymentStatus: 'pending',
+      status: 'pending_payment',
+      address: { line1: 'Other Road', city: 'Other City', state: 'Other State', pincode: '56789' }
+    });
+    otherRegistrationId = otherRegistration.id;
+
+    const inaccessible = await request(`/registrations/${otherRegistrationId}`, { headers: { cookie } });
+    assert.equal(inaccessible.response.status, 404);
+
+    const ownDetail = await request(`/registrations/${firstRegistration.id}`, { headers: { cookie } });
+    assert.equal(ownDetail.response.status, 200);
   });
 
   it('checks roles from the database for protected endpoints', async () => {

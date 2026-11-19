@@ -12,12 +12,12 @@ import argon2 from 'argon2';
 import { z } from 'zod';
 import { connectDatabase, disconnectDatabase } from './config/db';
 import { User, Registration, Payment, Submission, Verification, Audit, KitDispatch } from './models';
-import { AuthenticatedRequest, requireAdmin, requireAuth } from './middleware/auth';
+import { AuthenticatedRequest, requireAdmin, requireAuth, requireParticipant } from './middleware/auth';
+import { registrationPackages, PackageCode } from './config/packages';
 
 export const app = express();
 const PORT = Number(process.env.PORT || 4000);
 const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
-const prices: Record<string, number> = { '05': 80000, '10': 120000, '20': 150000 };
 
 const sessionCookieOptions = {
   httpOnly: true,
@@ -165,49 +165,99 @@ app.get('/api/v1/auth/me', requireAuth, async (req: AuthenticatedRequest, res, n
   }
 });
 
-// Registration and payments remain unchanged in this first module.
-app.post('/api/v1/registrations', async (req, res, next) => {
-  try {
-    const body = z.object({
-      name: z.string().min(2), email: z.string().email(), password: z.string().min(10),
-      phone: z.string().min(8), address: z.string().min(5), city: z.string().min(2),
-      state: z.string().min(2), pincode: z.string().min(5),
-      distancePackage: z.enum(['05', '10', '20'])
-    }).parse(req.body);
+function registrationResponse(registration: typeof Registration.prototype) {
+  const packageConfig = registrationPackages[registration.distancePackage as PackageCode];
+  return {
+    id: registration.id,
+    userId: registration.userId,
+    distancePackage: registration.distancePackage,
+    distanceKm: packageConfig.distanceKm,
+    amountPaise: packageConfig.amountPaise,
+    currency: registration.currency,
+    inclusions: packageConfig.inclusions,
+    address: registration.address,
+    paymentStatus: registration.paymentStatus,
+    status: registration.status,
+    createdAt: registration.createdAt,
+    updatedAt: registration.updatedAt
+  };
+}
 
-    let user = await User.findOne({ email: body.email.toLowerCase() });
-    if (!user) {
-      user = await User.create({
-        name: body.name,
-        email: body.email.toLowerCase(),
-        passwordHash: await argon2.hash(body.password, { type: argon2.argon2id }),
-        phone: body.phone,
-        role: 'participant'
-      });
-    } else {
-      return res.status(409).json({ message: 'An account with this email already exists. Please log in.' });
+app.post('/api/v1/registrations', requireAuth, requireParticipant, async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const idempotencyHeader = req.header('Idempotency-Key');
+    if (!idempotencyHeader || !/^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$/.test(idempotencyHeader)) {
+      return res.status(400).json({ message: 'A valid Idempotency-Key header is required' });
     }
 
-    const existing = await Registration.findOne({ userId: user._id });
-    if (existing) return res.status(409).json({ message: 'A registration already exists for this account' });
+    const body = z.object({
+      distancePackage: z.enum(['05', '10', '20']),
+      address: z.object({
+        line1: z.string().trim().min(5).max(200),
+        city: z.string().trim().min(2).max(100),
+        state: z.string().trim().min(2).max(100),
+        pincode: z.string().trim().min(5).max(12)
+      }).strict()
+    }).strict().parse(req.body);
 
-    const registration = await Registration.create({
-      userId: user._id,
-      distancePackage: body.distancePackage,
-      amountPaise: prices[body.distancePackage],
-      address: { line1: body.address, city: body.city, state: body.state, pincode: body.pincode }
+    const existing = await Registration.findOne({
+      userId: req.authUser?.id,
+      idempotencyKey: idempotencyHeader
     });
+    if (existing) {
+      return res.status(200).json({ registration: registrationResponse(existing) });
+    }
 
-    await regenerateSession(req);
-    req.session.userId = user.id;
-    await saveSession(req);
+    const packageConfig = registrationPackages[body.distancePackage];
+    try {
+      const registration = await Registration.create({
+        userId: req.authUser?.id,
+        idempotencyKey: idempotencyHeader,
+        distancePackage: body.distancePackage,
+        amountPaise: packageConfig.amountPaise,
+        currency: 'INR',
+        paymentStatus: 'pending',
+        status: 'pending_payment',
+        address: body.address
+      });
+      return res.status(201).json({ registration: registrationResponse(registration) });
+    } catch (error) {
+      if (typeof error === 'object' && error !== null && 'code' in error && error.code === 11000) {
+        const concurrentExisting = await Registration.findOne({
+          userId: req.authUser?.id,
+          idempotencyKey: idempotencyHeader
+        });
+        if (concurrentExisting) {
+          return res.status(200).json({ registration: registrationResponse(concurrentExisting) });
+        }
+      }
+      throw error;
+    }
+  } catch (error) {
+    return next(error);
+  }
+});
 
-    return res.status(201).json({
-      user: { id: user.id, name: user.name, email: user.email, role: user.role },
-      registrationId: registration.id,
-      amountPaise: registration.amountPaise,
-      paymentStatus: registration.paymentStatus
+app.get('/api/v1/registrations/me', requireAuth, requireParticipant, async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const registrations = await Registration.find({ userId: req.authUser?.id }).sort({ createdAt: -1 });
+    return res.json({ registrations: registrations.map(registrationResponse) });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.get('/api/v1/registrations/:id', requireAuth, requireParticipant, async (req: AuthenticatedRequest, res, next) => {
+  try {
+    if (!/^[a-f\d]{24}$/i.test(req.params.id)) {
+      return res.status(404).json({ message: 'Registration not found' });
+    }
+    const registration = await Registration.findOne({
+      _id: req.params.id,
+      userId: req.authUser?.id
     });
+    if (!registration) return res.status(404).json({ message: 'Registration not found' });
+    return res.json({ registration: registrationResponse(registration) });
   } catch (error) {
     return next(error);
   }
