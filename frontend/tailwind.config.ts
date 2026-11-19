@@ -1,0 +1,1 @@
+import type { Config } from 'tailwindcss'; export default { content: ['./src/**/*.{js,ts,jsx,tsx,mdx}'], theme: { extend: { colors: { ink:'#101820', lime:'#D9F36A', muted:'#6D777B' }, fontFamily: { sans:['Arial','sans-serif'] } } }, plugins: [] } satisfies Config;

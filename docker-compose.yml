@@ -1,0 +1,12 @@
+services:
+  mongodb:
+    image: mongo:7
+    ports: ["27017:27017"]
+    volumes: ["mongo_data:/data/db"]
+  backend:
+    build: ./backend
+    env_file: ./backend/.env
+    ports: ["4000:4000"]
+    depends_on: [mongodb]
+volumes:
+  mongo_data:

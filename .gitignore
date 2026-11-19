@@ -1,0 +1,100 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Environment files
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
+
+# JavaScript / TypeScript builds and caches
+.next/
+**/.next/
+dist/
+**/dist/
+build/
+**/build/
+coverage/
+**/coverage/
+.nyc_output/
+**/.nyc_output/
+.cache/
+**/.cache/
+
+# Test output
+test-results/
+**/test-results/
+playwright-report/
+**/playwright-report/
+jest-results/
+**/jest-results/
+
+# Python
+.venv/
+**/.venv/
+venv/
+**/venv/
+env/
+**/env/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+**/.pytest_cache/
+.mypy_cache/
+**/.mypy_cache/
+.ruff_cache/
+**/.ruff_cache/
+
+# Private uploads and user screenshots
+uploads/
+**/uploads/
+screenshots/
+**/screenshots/
+private-uploads/
+**/private-uploads/
+user-uploads/
+**/user-uploads/
+
+# Local database files
+*.db
+*.sqlite
+*.sqlite3
+mongo_data/
+**/mongo_data/
+
+# Logs and temporary files
+*.log
+logs/
+**/logs/
+*.tmp
+*.temp
+tmp/
+**/tmp/
+.tmp/
+**/.tmp/
+
+# IDE files
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.suo
+*.user
+*.sln.docstates
+
+# OS-generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# Local backups and audit archives
+/backend-backup/
+/backend-audit.zip
