@@ -68,3 +68,25 @@ test('login and protected registration use matching returnTo parameter', async (
   assert.match(registration, /\/login\?returnTo=/);
   assert.doesNotMatch(login, /location\.href=\/?['"]?\/register/);
 });
+
+test('dashboard integrates Razorpay create and verify APIs', async () => {
+  const dashboard = await source('src/app/dashboard/page.tsx');
+  const checkout = await source('src/lib/razorpayCheckout.ts');
+  assert.match(dashboard, /startRazorpayPayment/);
+  assert.match(dashboard, /Pay now|Retry payment/);
+  assert.match(dashboard, /loadRegistrations/);
+  assert.match(checkout, /\/payments\/create-order/);
+  assert.match(checkout, /\/payments\/verify/);
+  assert.match(checkout, /checkout\.razorpay\.com\/v1\/checkout\.js/);
+  assert.match(checkout, /razorpay_payment_id/);
+  assert.match(checkout, /razorpay_signature/);
+  assert.doesNotMatch(checkout, /amountPaise.*body|amountPaise.*JSON/);
+});
+
+test('registration page offers payment without creating another registration', async () => {
+  const registration = await source('src/app/register/page.tsx');
+  assert.match(registration, /startRazorpayPayment/);
+  assert.match(registration, /createdRegistration/);
+  assert.match(registration, /Pay now|Retry payment/);
+  assert.doesNotMatch(registration, /setCreatedRegistration.*Idempotency-Key/);
+});

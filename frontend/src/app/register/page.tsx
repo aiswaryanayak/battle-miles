@@ -1,6 +1,7 @@
 'use client';
 import {useSearchParams} from 'next/navigation';
 import {Suspense,useEffect,useState} from 'react';
+import {startRazorpayPayment,CheckoutResult} from '../../lib/razorpayCheckout';
 
 const API=process.env.NEXT_PUBLIC_API_URL||'http://localhost:4000/api/v1';
 
@@ -17,6 +18,9 @@ function RegisterForm(){
  const [busy,setBusy]=useState(false);
  const [idempotencyKey,setIdempotencyKey]=useState('');
  const [authChecked,setAuthChecked]=useState(false);
+ const [participant,setParticipant]=useState<{name?:string,email?:string,phone?:string}>({});
+ const [createdRegistration,setCreatedRegistration]=useState<any|null>(null);
+ const [paymentState,setPaymentState]=useState('');
  useEffect(()=>setIdempotencyKey(makeIdempotencyKey()),[]);
  useEffect(()=>{
   fetch(`${API}/auth/me`,{credentials:'include'})
@@ -30,7 +34,7 @@ function RegisterForm(){
    })
    .then(result=>{
     if(!result)return;
-    if(result.user?.role==='participant')setAuthChecked(true);
+     if(result.user?.role==='participant'){setParticipant(result.user);setAuthChecked(true);}
     else location.href='/admin';
    })
    .catch(()=>{
@@ -55,6 +59,7 @@ function RegisterForm(){
    });
    const d=await r.json();
    if(!r.ok) throw new Error(d.message||'Unable to register');
+   setCreatedRegistration(d.registration);
    setMessage(`Registration created. Amount: ₹${d.registration.amountPaise/100}. Payment status: pending.`);
   }catch(err){
    setMessage(err instanceof Error?err.message:'Something went wrong');
@@ -66,7 +71,35 @@ function RegisterForm(){
  function startAnother(){
   setIdempotencyKey(makeIdempotencyKey());
   setAddress({line1:'',city:'',state:'',pincode:''});
+  setCreatedRegistration(null);
+  setPaymentState('');
   setMessage('');
+ }
+
+ async function payCreatedRegistration(){
+  if(!createdRegistration||paymentState==='creating'||paymentState==='checkout'||paymentState==='verifying')return;
+  setPaymentState('creating');
+  setMessage('Creating payment order…');
+  const result:CheckoutResult=await startRazorpayPayment(
+   createdRegistration.id,
+   `${createdRegistration.distanceKm} KM`,
+   participant,
+   (phase,message)=>{setPaymentState(phase);setMessage(message)}
+  );
+  if(result.kind==='paid'){
+   setCreatedRegistration({...createdRegistration,paymentStatus:'paid',status:'confirmed'});
+   setPaymentState('paid');
+   setMessage('Payment verified successfully.');
+  }else if(result.kind==='pending'){
+   setPaymentState('pending');
+   setMessage(result.message);
+  }else if(result.kind==='cancelled'){
+   setPaymentState('cancelled');
+   setMessage(result.message);
+  }else{
+   setPaymentState('failed');
+   setMessage(result.message);
+  }
  }
 
  if(!authChecked){
@@ -85,6 +118,7 @@ function RegisterForm(){
    <p className="text-xs muted">All packages include a medal and runner badge. 10 KM also includes a refreshment pack. 20 KM also includes an event T-shirt.</p>
    <button disabled={busy} className="btn btn-dark w-full disabled:opacity-50">{busy?'Submitting…':'Create registration'}</button>
    {message&&<p role="status" className="text-sm p-3 rounded-lg bg-[#eef2e7]">{message}</p>}
+   {createdRegistration&&createdRegistration.paymentStatus!=='paid'&&<button type="button" disabled={['creating','checkout','verifying'].includes(paymentState)} className="btn btn-dark w-full disabled:opacity-50" onClick={payCreatedRegistration}>{paymentState==='failed'?'Retry payment':'Pay now'}</button>}
    {message.startsWith('Registration created.')&&<button type="button" className="btn w-full" onClick={startAnother}>Start another registration</button>}
   </form>
  </div></main>;
