@@ -4,21 +4,21 @@ from datetime import datetime
 
 def parse_duration(value: str) -> int | None:
     value = value.strip().lower()
-    colon = re.findall(r"\d+", value)
-    if ":" in value and 2 <= len(colon) <= 3:
-        numbers = [int(part) for part in colon]
-        if len(numbers) == 2:
-            minutes, seconds = numbers
+    colon_match = re.fullmatch(r"\s*(\d{1,3}):(\d{2})(?::(\d{2}))?\s*", value)
+    if colon_match:
+        parts = [int(part) for part in colon_match.groups() if part is not None]
+        if len(parts) == 2:
+            minutes, seconds = parts
             if seconds < 60:
                 return minutes * 60 + seconds
-        if len(numbers) == 3:
-            hours, minutes, seconds = numbers
+        elif len(parts) == 3:
+            hours, minutes, seconds = parts
             if minutes < 60 and seconds < 60:
                 return hours * 3600 + minutes * 60 + seconds
 
-    hours = re.search(r"(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour)", value)
-    minutes = re.search(r"(\d+(?:\.\d+)?)\s*(?:m|min|mins)", value)
-    seconds = re.search(r"(\d+(?:\.\d+)?)\s*(?:s|sec|secs)", value)
+    hours = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours)\b", value)
+    minutes = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:m|min|mins|minute|minutes)\b", value)
+    seconds = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)\b", value)
     if hours or minutes or seconds:
         total = 0
         if hours:
@@ -32,7 +32,10 @@ def parse_duration(value: str) -> int | None:
 
 
 def parse_pace(value: str) -> int | None:
-    match = re.search(r"(\d{1,2})[:.](\d{2})(?:\s*(?:/|\bper\b)?\s*(?:km|k\b))?", value.lower())
+    match = re.search(
+        r"(\d{1,2})[:.](\d{2})\s*(?:(?:min\s*)?/|per)?\s*(?:km|kilometer)",
+        value.lower(),
+    )
     if not match:
         return None
     minutes, seconds = int(match.group(1)), int(match.group(2))
@@ -72,15 +75,30 @@ def extract_running_metrics(text: str) -> dict:
         distance = round(value, 3)
 
     duration: int | None = None
-    duration_match = re.search(
-        r"(?:duration|time|elapsed)[^\n\d]*([0-9]{1,2}:[0-5]\d(?::[0-5]\d)?|\d+\s*(?:h(?:ours?|rs?)?|m(?:in(?:utes?|s)?|in)?|s(?:ec(?:onds?|s)?)))",
+    compound_duration_match = re.search(
+        r"\b(\d+\s*(?:h|hr|hrs|hours?)\s*)?"
+        r"(\d+\s*(?:m|min|mins|minutes?)\s*)"
+        r"(\d+\s*(?:s|sec|secs|seconds?)\s*)?\b",
         normalized,
     )
-    if duration_match:
-        duration = parse_duration(duration_match.group(1))
+    if compound_duration_match:
+        duration_text = compound_duration_match.group(0).strip()
+        duration = parse_duration(duration_text)
 
-    pace_match = re.search(r"(\d{1,2}[:.]\d{2})\s*(?:/|\bper\b)?\s*(?:km|k\b)", normalized)
-    pace = parse_pace(pace_match.group(1)) if pace_match else None
+    if duration is None:
+        colon_duration_match = re.search(
+            r"\b(\d{1,3}:\d{2}(?::\d{2})?)\b"
+            r"(?!\s*(?:(?:min\s*)?/|per)\s*(?:km|kilometer))",
+            normalized,
+        )
+        if colon_duration_match:
+            duration = parse_duration(colon_duration_match.group(1))
+
+    pace_match = re.search(
+        r"\b(\d{1,2}[:.]\d{2})\s*(?:(?:min\s*)?/|per)\s*(?:km|kilometer)",
+        normalized,
+    )
+    pace = parse_pace(pace_match.group(1) + " /km") if pace_match else None
     source = None
     for candidate in ("strava", "garmin", "nike run", "adidas", "runkeeper", "apple fitness", "fitbit"):
         if candidate in normalized:
