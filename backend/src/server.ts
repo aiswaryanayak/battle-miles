@@ -7,6 +7,8 @@ import session from 'express-session';
 import MongoStore from 'connect-mongo';
 import mongoose from 'mongoose';
 import crypto from 'crypto';
+import multer from 'multer';
+import sharp, { Metadata } from 'sharp';
 import argon2 from 'argon2';
 import { z } from 'zod';
 import { connectDatabase, disconnectDatabase } from './config/db';
@@ -14,11 +16,13 @@ import { User, Registration, Payment, Submission, Verification, Audit, KitDispat
 import { AuthenticatedRequest, requireAdmin, requireAuth, requireParticipant } from './middleware/auth';
 import { registrationPackages, PackageCode } from './config/packages';
 import { getRazorpayClient } from './config/razorpay';
+import { proofStorage } from './config/proofStorage';
 
 export const app = express();
 const PORT = Number(process.env.PORT || 4000);
 const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 const paymentOrderLocks = new Map<string, Promise<unknown>>();
+const submissionLocks = new Map<string, Promise<unknown>>();
 
 async function withPaymentOrderLock<T>(registrationId: string, operation: () => Promise<T>): Promise<T> {
   const previous = paymentOrderLocks.get(registrationId) ?? Promise.resolve();
@@ -28,6 +32,17 @@ async function withPaymentOrderLock<T>(registrationId: string, operation: () => 
     return await current;
   } finally {
     if (paymentOrderLocks.get(registrationId) === current) paymentOrderLocks.delete(registrationId);
+  }
+}
+
+async function withSubmissionLock<T>(registrationId: string, operation: () => Promise<T>): Promise<T> {
+  const previous = submissionLocks.get(registrationId) ?? Promise.resolve();
+  const current = previous.catch(() => undefined).then(operation);
+  submissionLocks.set(registrationId, current);
+  try {
+    return await current;
+  } finally {
+    if (submissionLocks.get(registrationId) === current) submissionLocks.delete(registrationId);
   }
 }
 
@@ -630,21 +645,121 @@ app.post('/api/v1/payments/verify', requireAuth, requireParticipant, async (req:
   } catch (error) { return next(error); }
 });
 
-app.post('/api/v1/submissions', requireAuth, async (req: AuthenticatedRequest, res, next) => {
+const proofUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024, files: 1, fields: 10 },
+  fileFilter: (_req, file, callback) => {
+    if (['image/jpeg', 'image/png', 'image/webp'].includes(file.mimetype)) {
+      callback(null, true);
+    } else {
+      callback(new multer.MulterError('LIMIT_UNEXPECTED_FILE', file.fieldname));
+    }
+  }
+});
+
+function safeSubmissionResponse(submission: typeof Submission.prototype) {
+  return {
+    id: submission.id,
+    registrationId: submission.registrationId,
+    status: submission.status,
+    mimeType: submission.mimeType,
+    originalFilename: submission.originalFilename,
+    createdAt: submission.createdAt,
+    updatedAt: submission.updatedAt
+  };
+}
+
+app.post('/api/v1/submissions', requireAuth, requireParticipant, proofUpload.single('proof'), async (req: AuthenticatedRequest, res, next) => {
+  let savedStorageKey: string | undefined;
   try {
-    const body = z.object({ registrationId: z.string(), storageKey: z.string().min(5), originalFilename: z.string(), mimeType: z.enum(['image/jpeg', 'image/png', 'image/webp']) }).parse(req.body);
-    const registration = await Registration.findOne({ _id: body.registrationId, userId: req.authUser?.id, paymentStatus: 'paid' });
-    if (!registration) return res.status(403).json({ message: 'A paid registration is required' });
-    const submission = await Submission.create({ ...body, registrationId: registration._id });
-    return res.status(201).json({ submissionId: submission.id, status: submission.status, message: 'Submission received; verification worker integration is pending.' });
+    const body = z.object({
+      registrationId: z.string().regex(/^[a-f\d]{24}$/i)
+    }).strict().parse(req.body);
+    if (!req.file) return res.status(400).json({ message: 'A proof image is required' });
+
+    const registration = await Registration.findOne({
+      _id: body.registrationId,
+      userId: req.authUser?.id,
+      paymentStatus: 'paid'
+    });
+    if (!registration) return res.status(404).json({ message: 'Registration not found or not eligible for proof submission' });
+    if (!['confirmed', 'run_pending'].includes(registration.status)) {
+      return res.status(409).json({ message: 'Registration is not eligible for proof submission' });
+    }
+
+    const allowedMimeTypes = ['image/jpeg', 'image/png', 'image/webp'] as const;
+    if (!allowedMimeTypes.includes(req.file.mimetype as typeof allowedMimeTypes[number])) {
+      return res.status(400).json({ message: 'Unsupported image type' });
+    }
+
+    let metadata: Metadata;
+    try {
+      metadata = await sharp(req.file.buffer).metadata();
+      await sharp(req.file.buffer).toBuffer();
+    } catch {
+      return res.status(400).json({ message: 'Malformed or unsupported image' });
+    }
+    const detectedMimeType =
+      metadata.format === 'jpeg' ? 'image/jpeg' :
+      metadata.format === 'png' ? 'image/png' :
+      metadata.format === 'webp' ? 'image/webp' :
+      null;
+    if (!detectedMimeType || metadata.width === undefined || metadata.height === undefined || metadata.width < 1 || metadata.height < 1) {
+      return res.status(400).json({ message: 'Malformed or unsupported image' });
+    }
+
+    const originalFilename = (req.file.originalname || 'proof')
+      .replace(/[^a-zA-Z0-9._-]/g, '_')
+      .replace(/^\.+/, '')
+      .slice(0, 255) || 'proof';
+
+    return await withSubmissionLock(registration.id, async () => {
+      const latest = await Submission.findOne({ registrationId: registration._id })
+        .sort({ createdAt: -1 });
+      if (latest && latest.status !== 'resubmission_requested') {
+        return res.status(409).json({ message: 'A submission is already pending or approved' });
+      }
+
+      const stored = await proofStorage.save(req.file!.buffer, detectedMimeType);
+      savedStorageKey = stored.storageKey;
+      try {
+        const submission = await Submission.create({
+          registrationId: registration._id,
+          userId: req.authUser?.id,
+          storageKey: stored.storageKey,
+          originalFilename,
+          mimeType: detectedMimeType,
+          status: 'queued'
+        });
+        return res.status(201).json({ submission: safeSubmissionResponse(submission) });
+      } catch (error) {
+        if (savedStorageKey) await proofStorage.delete(savedStorageKey);
+        throw error;
+      }
+    });
   } catch (error) { return next(error); }
 });
 
-app.get('/api/v1/submissions/me', requireAuth, async (req: AuthenticatedRequest, res, next) => {
+app.get('/api/v1/submissions/me', requireAuth, requireParticipant, async (req: AuthenticatedRequest, res, next) => {
   try {
     const registrations = await Registration.find({ userId: req.authUser?.id }).select('_id');
     const ids = registrations.map(registration => registration._id);
-    return res.json({ submissions: await Submission.find({ registrationId: { $in: ids } }).sort({ createdAt: -1 }) });
+    const submissions = await Submission.find({ registrationId: { $in: ids }, userId: req.authUser?.id })
+      .sort({ createdAt: -1 });
+    return res.json({ submissions: submissions.map(safeSubmissionResponse) });
+  } catch (error) { return next(error); }
+});
+
+app.get('/api/v1/submissions/registration/:id', requireAuth, requireParticipant, async (req: AuthenticatedRequest, res, next) => {
+  try {
+    if (!/^[a-f\d]{24}$/i.test(req.params.id)) {
+      return res.status(404).json({ message: 'Registration not found' });
+    }
+    const registration = await Registration.findOne({ _id: req.params.id, userId: req.authUser?.id });
+    if (!registration) return res.status(404).json({ message: 'Registration not found' });
+    const submissions = await Submission.find({ registrationId: registration._id, userId: req.authUser?.id })
+      .sort({ createdAt: -1 });
+    return res.json({ submissions: submissions.map(safeSubmissionResponse) });
   } catch (error) { return next(error); }
 });
 
@@ -704,6 +819,11 @@ app.get('/api/v1/admin/participants', requireAuth, requireAdmin, async (_req, re
 
 app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
   console.error(error instanceof Error ? error.message : error);
+  if (error instanceof multer.MulterError) {
+    if (error.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ message: 'Proof image exceeds the 10 MB limit' });
+    if (error.code === 'LIMIT_UNEXPECTED_FILE') return res.status(400).json({ message: 'Unsupported file field or image type' });
+    return res.status(400).json({ message: 'Invalid proof image upload' });
+  }
   if (error instanceof z.ZodError) return res.status(400).json({ message: 'Validation failed', errors: error.issues });
   if (typeof error === 'object' && error !== null && 'code' in error && error.code === 11000) {
     return res.status(409).json({ message: 'Email already registered' });

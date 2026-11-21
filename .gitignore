@@ -58,6 +58,8 @@ private-uploads/
 **/private-uploads/
 user-uploads/
 **/user-uploads/
+storage/
+**/storage/
 
 # Local database files
 *.db

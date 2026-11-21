@@ -2,6 +2,7 @@ import 'dotenv/config';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import crypto from 'node:crypto';
+import sharp from 'sharp';
 import { after, before, describe, it } from 'node:test';
 import argon2 from 'argon2';
 import mongoose from 'mongoose';
@@ -33,6 +34,8 @@ const suite = describe('authentication integration', () => {
   let User: typeof import('./models').User;
   let Registration: typeof import('./models').Registration;
   let Payment: typeof import('./models').Payment;
+  let Submission: typeof import('./models').Submission;
+  let proofStorage: typeof import('./config/proofStorage').proofStorage;
   let setRazorpayClientFactoryForTests: typeof import('./config/razorpay').setRazorpayClientFactoryForTests;
   let resetRazorpayClientFactory: typeof import('./config/razorpay').resetRazorpayClientFactory;
   let server: http.Server;
@@ -50,6 +53,10 @@ const suite = describe('authentication integration', () => {
 
   function cookieHeader(setCookie: string): string {
     return setCookie.split(';', 1)[0];
+  }
+
+  function bufferToArrayBuffer(buffer: Buffer): ArrayBuffer {
+    return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength) as ArrayBuffer;
   }
 
   async function getParticipantCookie(): Promise<string> {
@@ -136,10 +143,12 @@ const suite = describe('authentication integration', () => {
     process.env.RAZORPAY_KEY_ID = 'rzp_test_battle_miles';
     process.env.RAZORPAY_KEY_SECRET = 'battle_miles_test_secret';
     process.env.RAZORPAY_WEBHOOK_SECRET = 'battle_miles_test_webhook_secret';
+    process.env.PROOF_STORAGE_DIR = 'storage/proofs-test';
     ({ app, closeSessionStore } = await import('./server'));
     ({ connectDatabase, disconnectDatabase } = await import('./config/db'));
     ({ setRazorpayClientFactoryForTests, resetRazorpayClientFactory } = await import('./config/razorpay'));
-    ({ User, Registration, Payment } = await import('./models'));
+    ({ User, Registration, Payment, Submission } = await import('./models'));
+    ({ proofStorage } = await import('./config/proofStorage'));
     await connectDatabase();
     server = app.listen(0);
     await new Promise<void>(resolve => server.once('listening', () => resolve()));
@@ -155,6 +164,7 @@ const suite = describe('authentication integration', () => {
         userId: { $in: userIds.map(id => new mongoose.Types.ObjectId(id)) }
       }).distinct('_id');
       await Payment.deleteMany({ registrationId: { $in: registrationIds } });
+      await Submission.deleteMany({ registrationId: { $in: registrationIds } });
       await Registration.deleteMany({
         userId: { $in: userIds.map(id => new mongoose.Types.ObjectId(id)) }
       });
@@ -168,6 +178,7 @@ const suite = describe('authentication integration', () => {
     }
     await new Promise<void>(resolve => server.close(() => resolve()));
     await closeSessionStore();
+    await proofStorage.clearTestDirectory();
     resetRazorpayClientFactory();
     await disconnectDatabase();
   });
@@ -958,6 +969,167 @@ const suite = describe('authentication integration', () => {
       body: mismatchAmountBody
     });
     assert.equal(mismatchAmount.response.status, 409);
+  });
+
+  it('rejects unauthenticated proof submissions', async () => {
+    const form = new FormData();
+    form.append('registrationId', '507f1f77bcf86cd799439011');
+    const png = await sharp({
+      create: { width: 32, height: 32, channels: 3, background: '#ffffff' }
+    }).png().toBuffer();
+    form.append('proof', new Blob([bufferToArrayBuffer(png)], { type: 'image/png' }), 'proof.png');
+    const response = await request('/submissions', {
+      method: 'POST',
+      body: form
+    });
+    assert.equal(response.response.status, 401);
+  });
+
+  it('allows valid proof, rejects duplicates, and retrieves owned status', async () => {
+    const cookie = await getParticipantCookie();
+    const registration = await createPaymentRegistration('05', 'paid');
+    await Registration.findByIdAndUpdate(registration.id, { $set: { status: 'confirmed' } });
+    const png = await sharp({
+      create: { width: 64, height: 64, channels: 3, background: '#ffffff' }
+    }).png().toBuffer();
+
+    const firstForm = new FormData();
+    firstForm.append('registrationId', registration.id);
+    firstForm.append('proof', new Blob([bufferToArrayBuffer(png)], { type: 'image/png' }), 'proof.png');
+    const first = await request('/submissions', {
+      method: 'POST',
+      headers: { cookie },
+      body: firstForm
+    });
+    assert.equal(first.response.status, 201);
+    assert(first.body.submission);
+    assert.equal((first.body.submission as Record<string, unknown>).status, 'queued');
+    assert.equal((first.body.submission as Record<string, unknown>).storageKey, undefined);
+
+    const status = await request(`/submissions/registration/${registration.id}`, {
+      headers: { cookie }
+    });
+    assert.equal(status.response.status, 200);
+    const submissionRows = status.body.submissions as Record<string, unknown>[];
+    assert.equal(submissionRows.length, 1);
+
+    const duplicateForm = new FormData();
+    duplicateForm.append('registrationId', registration.id);
+    duplicateForm.append('proof', new Blob([bufferToArrayBuffer(png)], { type: 'image/png' }), 'proof-copy.png');
+    const duplicate = await request('/submissions', {
+      method: 'POST',
+      headers: { cookie },
+      body: duplicateForm
+    });
+    assert.equal(duplicate.response.status, 409);
+
+    const concurrentlyCreated = await createPaymentRegistration('10', 'paid');
+    await Registration.findByIdAndUpdate(concurrentlyCreated.id, { $set: { status: 'run_pending' } });
+    const concurrentBody = () => {
+      const form = new FormData();
+      form.append('registrationId', concurrentlyCreated.id);
+      form.append('proof', new Blob([bufferToArrayBuffer(png)], { type: 'image/png' }), 'concurrent.png');
+      return form;
+    };
+    const concurrent = await Promise.all([
+      request('/submissions', { method: 'POST', headers: { cookie }, body: concurrentBody() }),
+      request('/submissions', { method: 'POST', headers: { cookie }, body: concurrentBody() })
+    ]);
+    assert.deepEqual(concurrent.map(result => result.response.status).sort(), [201, 409]);
+  });
+
+  it('rejects unpaid and foreign registrations', async () => {
+    const cookie = await getParticipantCookie();
+    const unpaid = await createPaymentRegistration('05', 'pending');
+    await Registration.findByIdAndUpdate(unpaid.id, { $set: { status: 'pending_payment' } });
+    const png = await sharp({
+      create: { width: 32, height: 32, channels: 3, background: '#ffffff' }
+    }).png().toBuffer();
+    const unpaidForm = new FormData();
+    unpaidForm.append('registrationId', unpaid.id);
+    unpaidForm.append('proof', new Blob([bufferToArrayBuffer(png)], { type: 'image/png' }), 'unpaid.png');
+    const unpaidResponse = await request('/submissions', {
+      method: 'POST',
+      headers: { cookie },
+      body: unpaidForm
+    });
+    assert.equal(unpaidResponse.response.status, 404);
+
+    const foreign = await createPaymentRegistration('05', 'paid');
+    if (otherParticipantId) {
+      await Registration.findByIdAndUpdate(foreign.id, { $set: { userId: new mongoose.Types.ObjectId(otherParticipantId) } });
+    }
+    const foreignForm = new FormData();
+    foreignForm.append('registrationId', foreign.id);
+    foreignForm.append('proof', new Blob([bufferToArrayBuffer(png)], { type: 'image/png' }), 'foreign.png');
+    const foreignResponse = await request('/submissions', {
+      method: 'POST',
+      headers: { cookie },
+      body: foreignForm
+    });
+    assert.equal(foreignResponse.response.status, 404);
+  });
+
+  it('rejects invalid, oversized, and malformed proof images', async () => {
+    const cookie = await getParticipantCookie();
+    const registration = await createPaymentRegistration('05', 'paid');
+    await Registration.findByIdAndUpdate(registration.id, { $set: { status: 'confirmed' } });
+
+    const textForm = new FormData();
+    textForm.append('registrationId', registration.id);
+    textForm.append('proof', new Blob(['not an image'], { type: 'text/plain' }), 'proof.txt');
+    const textResponse = await request('/submissions', {
+      method: 'POST',
+      headers: { cookie },
+      body: textForm
+    });
+    assert.equal(textResponse.response.status, 400);
+
+    const oversizedForm = new FormData();
+    oversizedForm.append('registrationId', registration.id);
+    oversizedForm.append('proof', new Blob([bufferToArrayBuffer(Buffer.alloc(10 * 1024 * 1024 + 1))], { type: 'image/png' }), 'oversized.png');
+    const oversized = await request('/submissions', {
+      method: 'POST',
+      headers: { cookie },
+      body: oversizedForm
+    });
+    assert.equal(oversized.response.status, 413);
+
+    const malformedForm = new FormData();
+    malformedForm.append('registrationId', registration.id);
+    malformedForm.append('proof', new Blob([bufferToArrayBuffer(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00]))], { type: 'image/png' }), 'malformed.png');
+    const malformed = await request('/submissions', {
+      method: 'POST',
+      headers: { cookie },
+      body: malformedForm
+    });
+    assert.equal(malformed.response.status, 400);
+  });
+
+  it('allows a resubmission only after admin requests one', async () => {
+    const cookie = await getParticipantCookie();
+    const registration = await createPaymentRegistration('05', 'paid');
+    await Registration.findByIdAndUpdate(registration.id, { $set: { status: 'confirmed' } });
+    const png = await sharp({
+      create: { width: 32, height: 32, channels: 3, background: '#ffffff' }
+    }).png().toBuffer();
+    await Submission.create({
+      registrationId: registration._id,
+      userId: new mongoose.Types.ObjectId(participantId!),
+      storageKey: 'placeholder.png',
+      originalFilename: 'placeholder.png',
+      mimeType: 'image/png',
+      status: 'resubmission_requested'
+    });
+    const form = new FormData();
+    form.append('registrationId', registration.id);
+    form.append('proof', new Blob([bufferToArrayBuffer(png)], { type: 'image/png' }), 'resubmission.png');
+    const response = await request('/submissions', {
+      method: 'POST',
+      headers: { cookie },
+      body: form
+    });
+    assert.equal(response.response.status, 201);
   });
 
   it('checks roles from the database for protected endpoints', async () => {
