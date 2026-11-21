@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import crypto from 'node:crypto';
 import { after, before, describe, it } from 'node:test';
 import argon2 from 'argon2';
 import mongoose from 'mongoose';
@@ -30,12 +31,16 @@ const suite = describe('authentication integration', () => {
   let disconnectDatabase: typeof import('./config/db').disconnectDatabase;
   let User: typeof import('./models').User;
   let Registration: typeof import('./models').Registration;
+  let Payment: typeof import('./models').Payment;
+  let setRazorpayClientFactoryForTests: typeof import('./config/razorpay').setRazorpayClientFactoryForTests;
+  let resetRazorpayClientFactory: typeof import('./config/razorpay').resetRazorpayClientFactory;
   let server: http.Server;
   let baseUrl: string;
   let participantId: string | undefined;
   let adminId: string | undefined;
   let otherParticipantId: string | undefined;
   let otherRegistrationId: string | undefined;
+  let paymentFixtureCounter = 0;
 
   async function request(path: string, init: RequestInit = {}): Promise<{ response: Response; body: Record<string, unknown> }> {
     const response = await fetch(`${baseUrl}${path}`, init);
@@ -44,6 +49,44 @@ const suite = describe('authentication integration', () => {
 
   function cookieHeader(setCookie: string): string {
     return setCookie.split(';', 1)[0];
+  }
+
+  async function getParticipantCookie(): Promise<string> {
+    const login = await request('/auth/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: participantEmail, password: 'StrongPassword123!' })
+    });
+    assert.equal(login.response.status, 200);
+    const setCookie = login.response.headers.get('set-cookie');
+    assert(setCookie);
+    return cookieHeader(setCookie);
+  }
+
+  async function createPaymentRegistration(distancePackage: '05' | '10' | '20' = '05', paymentStatus: 'pending' | 'paid' | 'failed' = 'pending') {
+    assert(participantId);
+    paymentFixtureCounter += 1;
+    return Registration.create({
+      userId: new mongoose.Types.ObjectId(participantId),
+      idempotencyKey: `payment-fixture-${runId}-${paymentFixtureCounter}-key`,
+      distancePackage,
+      amountPaise: distancePackage === '05' ? 80000 : distancePackage === '10' ? 120000 : 150000,
+      currency: 'INR',
+      paymentStatus,
+      status: paymentStatus === 'paid' ? 'confirmed' : 'pending_payment',
+      address: {
+        line1: 'Payment Test Road',
+        city: 'Test City',
+        state: 'Test State',
+        pincode: '12345'
+      }
+    });
+  }
+
+  function validSignature(orderId: string, paymentId: string): string {
+    return crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET!)
+      .update(`${orderId}|${paymentId}`)
+      .digest('hex');
   }
 
   async function getSessionIdsForUsers(userIds: string[]): Promise<string[]> {
@@ -65,9 +108,12 @@ const suite = describe('authentication integration', () => {
     process.env.MONGODB_URI = testUri;
     process.env.SESSION_SECRET = process.env.SESSION_SECRET || 'test-only-session-secret-that-is-long-enough';
     process.env.FRONTEND_ORIGIN = 'http://localhost:3000';
+    process.env.RAZORPAY_KEY_ID = 'rzp_test_battle_miles';
+    process.env.RAZORPAY_KEY_SECRET = 'battle_miles_test_secret';
     ({ app, closeSessionStore } = await import('./server'));
     ({ connectDatabase, disconnectDatabase } = await import('./config/db'));
-    ({ User, Registration } = await import('./models'));
+    ({ setRazorpayClientFactoryForTests, resetRazorpayClientFactory } = await import('./config/razorpay'));
+    ({ User, Registration, Payment } = await import('./models'));
     await connectDatabase();
     server = app.listen(0);
     await new Promise<void>(resolve => server.once('listening', () => resolve()));
@@ -79,6 +125,10 @@ const suite = describe('authentication integration', () => {
   after(async () => {
     const userIds = [participantId, adminId, otherParticipantId].filter((id): id is string => Boolean(id));
     if (userIds.length > 0) {
+      const registrationIds = await Registration.find({
+        userId: { $in: userIds.map(id => new mongoose.Types.ObjectId(id)) }
+      }).distinct('_id');
+      await Payment.deleteMany({ registrationId: { $in: registrationIds } });
       await Registration.deleteMany({
         userId: { $in: userIds.map(id => new mongoose.Types.ObjectId(id)) }
       });
@@ -92,6 +142,7 @@ const suite = describe('authentication integration', () => {
     }
     await new Promise<void>(resolve => server.close(() => resolve()));
     await closeSessionStore();
+    resetRazorpayClientFactory();
     await disconnectDatabase();
   });
 
@@ -345,6 +396,371 @@ const suite = describe('authentication integration', () => {
 
     const ownDetail = await request(`/registrations/${firstRegistration.id}`, { headers: { cookie } });
     assert.equal(ownDetail.response.status, 200);
+  });
+
+  it('requires authentication and participant ownership for payment order creation', async () => {
+    const unauthenticated = await request('/payments/create-order', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ registrationId: '507f1f77bcf86cd799439011' })
+    });
+    assert.equal(unauthenticated.response.status, 401);
+
+    const cookie = await getParticipantCookie();
+    const registration = await createPaymentRegistration();
+    const other = await Registration.findOne({ userId: { $ne: new mongoose.Types.ObjectId(participantId!) } });
+    const foreignId = other?.id || '507f1f77bcf86cd799439011';
+    const owned = await request('/payments/create-order', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ registrationId: foreignId })
+    });
+    assert.equal(owned.response.status, 404);
+    assert(registration.id);
+  });
+
+  it('creates server-priced orders and reuses an existing usable order', async () => {
+    const cookie = await getParticipantCookie();
+    const registration = await createPaymentRegistration('05');
+    let createCount = 0;
+    setRazorpayClientFactoryForTests(() => ({
+      orders: {
+        create: async (params: any) => {
+          createCount += 1;
+          assert.equal(params.amount, 80000);
+          assert.equal(params.currency, 'INR');
+          return { id: `order_reuse_${runId}`, amount: params.amount, currency: 'INR', status: 'created' };
+        },
+        fetch: async (orderId: string) => ({
+          id: orderId,
+          amount: 80000,
+          currency: 'INR',
+          status: 'created',
+          receipt: `bm_${registration.id}`
+        })
+      },
+      payments: { fetch: async () => ({}) }
+    }));
+
+    const first = await request('/payments/create-order', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ registrationId: registration.id, amountPaise: 1 })
+    });
+    assert.equal(first.response.status, 400);
+
+    const valid = await request('/payments/create-order', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ registrationId: registration.id })
+    });
+    assert.equal(valid.response.status, 200);
+    assert.equal((valid.body.orderId), `order_reuse_${runId}`);
+
+    const reused = await request('/payments/create-order', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ registrationId: registration.id })
+    });
+    assert.equal(reused.response.status, 200);
+    assert.equal(reused.body.orderId, valid.body.orderId);
+    assert.equal(createCount, 1);
+  });
+
+  it('rejects payment order creation for paid registrations', async () => {
+    const cookie = await getParticipantCookie();
+    const registration = await createPaymentRegistration('10', 'paid');
+    const response = await request('/payments/create-order', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ registrationId: registration.id })
+    });
+    assert.equal(response.response.status, 409);
+  });
+
+  it('rejects invalid signatures and wrong registration/order relationships', async () => {
+    const cookie = await getParticipantCookie();
+    const registration = await createPaymentRegistration('05');
+    const orderId = `order_invalid_${runId}`;
+    await Payment.create({
+      registrationId: registration._id,
+      razorpayOrderId: orderId,
+      amountPaise: 80000,
+      status: 'created'
+    });
+    const invalid = await request('/payments/verify', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({
+        registrationId: registration.id,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: `pay_invalid_${runId}`,
+        razorpay_signature: '0'.repeat(64)
+      })
+    });
+    assert.equal(invalid.response.status, 400);
+
+    const wrongRegistration = await createPaymentRegistration('05');
+    const wrong = await request('/payments/verify', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({
+        registrationId: wrongRegistration.id,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: `pay_wrong_${runId}`,
+        razorpay_signature: validSignature(orderId, `pay_wrong_${runId}`)
+      })
+    });
+    assert.equal(wrong.response.status, 404);
+  });
+
+  it('validates amount and currency after a valid signature', async () => {
+    const cookie = await getParticipantCookie();
+    const registration = await createPaymentRegistration('10');
+    const orderId = `order_amount_${runId}`;
+    const paymentId = `pay_amount_${runId}`;
+    await Payment.create({
+      registrationId: registration._id,
+      razorpayOrderId: orderId,
+      amountPaise: 120000,
+      status: 'created'
+    });
+    setRazorpayClientFactoryForTests(() => ({
+      orders: {
+        create: async () => ({}),
+        fetch: async () => ({ id: orderId, amount: 119999, currency: 'INR', status: 'created' })
+      },
+      payments: {
+        fetch: async () => ({
+          id: paymentId,
+          order_id: orderId,
+          amount: 119999,
+          currency: 'INR',
+          status: 'captured',
+          captured: true
+        })
+      }
+    }));
+    const response = await request('/payments/verify', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({
+        registrationId: registration.id,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentId,
+        razorpay_signature: validSignature(orderId, paymentId)
+      })
+    });
+    assert.equal(response.response.status, 409);
+    const unchanged = await Registration.findById(registration.id);
+    assert.equal(unchanged?.paymentStatus, 'pending');
+  });
+
+  it('does not reuse a payment ID across registrations', async () => {
+    const cookie = await getParticipantCookie();
+    const first = await createPaymentRegistration('05');
+    const second = await createPaymentRegistration('05');
+    const orderId = `order_reuse_payment_${runId}`;
+    const paymentId = `pay_reuse_${runId}`;
+    await Payment.create({
+      registrationId: first._id,
+      razorpayOrderId: orderId,
+      razorpayPaymentId: paymentId,
+      amountPaise: 80000,
+      status: 'captured',
+      signatureVerified: true
+    });
+    await Payment.create({
+      registrationId: second._id,
+      razorpayOrderId: `order_second_${runId}`,
+      amountPaise: 80000,
+      status: 'created'
+    });
+    const response = await request('/payments/verify', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({
+        registrationId: second.id,
+        razorpay_order_id: `order_second_${runId}`,
+        razorpay_payment_id: paymentId,
+        razorpay_signature: validSignature(`order_second_${runId}`, paymentId)
+      })
+    });
+    assert.equal(response.response.status, 409);
+  });
+
+  it('does not mark authorized uncaptured payments paid', async () => {
+    const cookie = await getParticipantCookie();
+    const registration = await createPaymentRegistration('05');
+    const orderId = `order_authorized_${runId}`;
+    const paymentId = `pay_authorized_${runId}`;
+    await Payment.create({
+      registrationId: registration._id,
+      razorpayOrderId: orderId,
+      amountPaise: 80000,
+      status: 'created'
+    });
+    setRazorpayClientFactoryForTests(() => ({
+      orders: {
+        create: async () => ({}),
+        fetch: async () => ({ id: orderId, amount: 80000, currency: 'INR', status: 'attempted' })
+      },
+      payments: {
+        fetch: async () => ({
+          id: paymentId,
+          order_id: orderId,
+          amount: 80000,
+          currency: 'INR',
+          status: 'authorized',
+          captured: false
+        })
+      }
+    }));
+    const response = await request('/payments/verify', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({
+        registrationId: registration.id,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentId,
+        razorpay_signature: validSignature(orderId, paymentId)
+      })
+    });
+    assert.equal(response.response.status, 200);
+    assert.equal(response.body.verified, false);
+    const updated = await Registration.findById(registration.id);
+    assert.equal(updated?.paymentStatus, 'pending');
+    assert.equal(updated?.status, 'pending_payment');
+  });
+
+  it('serializes concurrent order creation and returns one reusable order', async () => {
+    const cookie = await getParticipantCookie();
+    const registration = await createPaymentRegistration('05');
+    let createCount = 0;
+    setRazorpayClientFactoryForTests(() => ({
+      orders: {
+        create: async (params: any) => {
+          createCount += 1;
+          await new Promise(resolve => setTimeout(resolve, 20));
+          return { id: `order_concurrent_${runId}`, amount: params.amount, currency: 'INR', status: 'created' };
+        },
+        fetch: async (orderId: string) => ({
+          id: orderId,
+          amount: 80000,
+          currency: 'INR',
+          status: 'created'
+        })
+      },
+      payments: { fetch: async () => ({}) }
+    }));
+    const body = JSON.stringify({ registrationId: registration.id });
+    const responses = await Promise.all([1, 2].map(() => request('/payments/create-order', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body
+    })));
+    assert(responses.every(result => result.response.status === 200));
+    assert.equal(createCount, 1);
+  });
+
+  it('does not mark failed payments paid', async () => {
+    const cookie = await getParticipantCookie();
+    const registration = await createPaymentRegistration('10');
+    const orderId = `order_failed_${runId}`;
+    const paymentId = `pay_failed_${runId}`;
+    await Payment.create({
+      registrationId: registration._id,
+      razorpayOrderId: orderId,
+      amountPaise: 120000,
+      status: 'created'
+    });
+    setRazorpayClientFactoryForTests(() => ({
+      orders: {
+        create: async () => ({}),
+        fetch: async () => ({ id: orderId, amount: 120000, currency: 'INR', status: 'attempted' })
+      },
+      payments: {
+        fetch: async () => ({
+          id: paymentId,
+          order_id: orderId,
+          amount: 120000,
+          currency: 'INR',
+          status: 'failed',
+          captured: false
+        })
+      }
+    }));
+    const response = await request('/payments/verify', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({
+        registrationId: registration.id,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentId,
+        razorpay_signature: validSignature(orderId, paymentId)
+      })
+    });
+    assert.equal(response.response.status, 200);
+    assert.equal(response.body.verified, false);
+    const updatedRegistration = await Registration.findById(registration.id);
+    const updatedPayment = await Payment.findOne({ registrationId: registration._id, razorpayOrderId: orderId });
+    assert.equal(updatedRegistration?.paymentStatus, 'failed');
+    assert.equal(updatedRegistration?.status, 'pending_payment');
+    assert.equal(updatedPayment?.status, 'failed');
+  });
+
+  it('marks captured payments paid and keeps duplicate verification idempotent', async () => {
+    const cookie = await getParticipantCookie();
+    const registration = await createPaymentRegistration('20');
+    const orderId = `order_captured_${runId}`;
+    const paymentId = `pay_captured_${runId}`;
+    await Payment.create({
+      registrationId: registration._id,
+      razorpayOrderId: orderId,
+      amountPaise: 150000,
+      status: 'created'
+    });
+    setRazorpayClientFactoryForTests(() => ({
+      orders: {
+        create: async () => ({}),
+        fetch: async () => ({ id: orderId, amount: 150000, currency: 'INR', status: 'paid' })
+      },
+      payments: {
+        fetch: async () => ({
+          id: paymentId,
+          order_id: orderId,
+          amount: 150000,
+          currency: 'INR',
+          status: 'captured',
+          captured: true
+        })
+      }
+    }));
+    const body = JSON.stringify({
+      registrationId: registration.id,
+      razorpay_order_id: orderId,
+      razorpay_payment_id: paymentId,
+      razorpay_signature: validSignature(orderId, paymentId)
+    });
+    const first = await request('/payments/verify', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body
+    });
+    assert.equal(first.response.status, 200);
+    assert.equal(first.body.verified, true);
+    const second = await request('/payments/verify', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body
+    });
+    assert.equal(second.response.status, 200);
+    assert.equal(second.body.verified, true);
+    const updatedRegistration = await Registration.findById(registration.id);
+    const updatedPayment = await Payment.findOne({ registrationId: registration._id, razorpayOrderId: orderId });
+    assert.equal(updatedRegistration?.paymentStatus, 'paid');
+    assert.equal(updatedRegistration?.status, 'confirmed');
+    assert.equal(updatedPayment?.status, 'captured');
   });
 
   it('checks roles from the database for protected endpoints', async () => {

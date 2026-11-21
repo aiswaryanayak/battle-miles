@@ -6,7 +6,6 @@ import rateLimit from 'express-rate-limit';
 import session from 'express-session';
 import MongoStore from 'connect-mongo';
 import mongoose from 'mongoose';
-import Razorpay from 'razorpay';
 import crypto from 'crypto';
 import argon2 from 'argon2';
 import { z } from 'zod';
@@ -14,10 +13,23 @@ import { connectDatabase, disconnectDatabase } from './config/db';
 import { User, Registration, Payment, Submission, Verification, Audit, KitDispatch } from './models';
 import { AuthenticatedRequest, requireAdmin, requireAuth, requireParticipant } from './middleware/auth';
 import { registrationPackages, PackageCode } from './config/packages';
+import { getRazorpayClient } from './config/razorpay';
 
 export const app = express();
 const PORT = Number(process.env.PORT || 4000);
 const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
+const paymentOrderLocks = new Map<string, Promise<unknown>>();
+
+async function withPaymentOrderLock<T>(registrationId: string, operation: () => Promise<T>): Promise<T> {
+  const previous = paymentOrderLocks.get(registrationId) ?? Promise.resolve();
+  const current = previous.catch(() => undefined).then(operation);
+  paymentOrderLocks.set(registrationId, current);
+  try {
+    return await current;
+  } finally {
+    if (paymentOrderLocks.get(registrationId) === current) paymentOrderLocks.delete(registrationId);
+  }
+}
 
 const sessionCookieOptions = {
   httpOnly: true,
@@ -263,29 +275,119 @@ app.get('/api/v1/registrations/:id', requireAuth, requireParticipant, async (req
   }
 });
 
-app.post('/api/v1/payments/create-order', requireAuth, async (req: AuthenticatedRequest, res, next) => {
+app.post('/api/v1/payments/create-order', requireAuth, requireParticipant, async (req: AuthenticatedRequest, res, next) => {
   try {
     if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) {
       return res.status(503).json({ message: 'Payment gateway is not configured' });
     }
-    const body = z.object({ registrationId: z.string().regex(/^[a-f\d]{24}$/i) }).parse(req.body);
+    const body = z.object({ registrationId: z.string().regex(/^[a-f\d]{24}$/i) }).strict().parse(req.body);
     const registration = await Registration.findOne({ _id: body.registrationId, userId: req.authUser?.id });
     if (!registration) return res.status(404).json({ message: 'Registration not found' });
-    const razorpay = new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID, key_secret: process.env.RAZORPAY_KEY_SECRET });
-    const order = await razorpay.orders.create({ amount: registration.amountPaise, currency: 'INR', receipt: `bm_${registration.id}` });
-    await Payment.create({ registrationId: registration._id, razorpayOrderId: order.id, amountPaise: registration.amountPaise });
-    return res.json({ orderId: order.id, amount: order.amount, currency: order.currency, keyId: process.env.RAZORPAY_KEY_ID });
+    if (registration.paymentStatus === 'paid') {
+      return res.status(409).json({ message: 'Registration is already paid' });
+    }
+
+    const packageConfig = registrationPackages[registration.distancePackage as PackageCode];
+    if (!packageConfig || registration.amountPaise !== packageConfig.amountPaise || registration.currency !== 'INR') {
+      return res.status(409).json({ message: 'Registration payment amount is invalid' });
+    }
+
+    return await withPaymentOrderLock(registration.id, async () => {
+      const currentRegistration = await Registration.findOne({ _id: registration._id, userId: req.authUser?.id });
+      if (!currentRegistration) return res.status(404).json({ message: 'Registration not found' });
+      if (currentRegistration.paymentStatus === 'paid') {
+        return res.status(409).json({ message: 'Registration is already paid' });
+      }
+
+      const existing = await Payment.findOne({
+        registrationId: currentRegistration._id,
+        razorpayOrderId: { $exists: true, $ne: null },
+        status: { $in: ['created', 'authorized'] }
+      }).sort({ createdAt: -1 });
+
+      if (existing?.razorpayOrderId) {
+        try {
+          const existingOrder = await getRazorpayClient().orders.fetch(existing.razorpayOrderId);
+          if (
+            existingOrder.id === existing.razorpayOrderId &&
+            Number(existingOrder.amount) === currentRegistration.amountPaise &&
+            existingOrder.currency === 'INR' &&
+            (existingOrder.status === 'created' || existingOrder.status === 'attempted')
+          ) {
+            return res.json({
+              orderId: existing.razorpayOrderId,
+              amount: existingOrder.amount,
+              currency: existingOrder.currency,
+              keyId: process.env.RAZORPAY_KEY_ID
+            });
+          }
+          if (existingOrder.id === existing.razorpayOrderId && existingOrder.status === 'paid') {
+            return res.status(409).json({ message: 'Payment order is already paid; verification is required' });
+          }
+        } catch {
+          return res.status(502).json({ message: 'Unable to verify existing payment order' });
+        }
+      }
+
+      let order: any;
+      try {
+        order = await getRazorpayClient().orders.create({
+          amount: currentRegistration.amountPaise,
+          currency: 'INR',
+          receipt: `bm_${currentRegistration.id}`
+        });
+      } catch {
+        return res.status(502).json({ message: 'Unable to create payment order' });
+      }
+
+      if (!order?.id || Number(order.amount) !== currentRegistration.amountPaise || order.currency !== 'INR') {
+        return res.status(502).json({ message: 'Payment gateway returned an invalid order' });
+      }
+
+      try {
+        await Payment.create({
+          registrationId: currentRegistration._id,
+          razorpayOrderId: order.id,
+          amountPaise: currentRegistration.amountPaise,
+          status: 'created',
+          signatureVerified: false
+        });
+      } catch (error) {
+        const existingByOrder = await Payment.findOne({
+          registrationId: currentRegistration._id,
+          razorpayOrderId: order.id
+        });
+        if (!existingByOrder) throw error;
+      }
+
+      return res.json({
+        orderId: order.id,
+        amount: order.amount,
+        currency: order.currency,
+        keyId: process.env.RAZORPAY_KEY_ID
+      });
+    });
   } catch (error) { return next(error); }
 });
 
-app.post('/api/v1/payments/verify', requireAuth, async (req: AuthenticatedRequest, res, next) => {
+app.post('/api/v1/payments/verify', requireAuth, requireParticipant, async (req: AuthenticatedRequest, res, next) => {
   try {
     if (!process.env.RAZORPAY_KEY_SECRET) return res.status(503).json({ message: 'Payment gateway is not configured' });
     const body = z.object({
       registrationId: z.string().regex(/^[a-f\d]{24}$/i),
-      razorpay_order_id: z.string().min(1), razorpay_payment_id: z.string().min(1),
+      razorpay_order_id: z.string().trim().min(1).max(128),
+      razorpay_payment_id: z.string().trim().min(1).max(128),
       razorpay_signature: z.string().regex(/^[a-f\d]{64}$/i)
-    }).parse(req.body);
+    }).strict().parse(req.body);
+
+    const registration = await Registration.findOne({ _id: body.registrationId, userId: req.authUser?.id });
+    if (!registration) return res.status(404).json({ message: 'Registration not found' });
+
+    const packageConfig = registrationPackages[registration.distancePackage as PackageCode];
+    if (!packageConfig || registration.amountPaise !== packageConfig.amountPaise || registration.currency !== 'INR') {
+      return res.status(409).json({ message: 'Registration payment amount is invalid' });
+    }
+
     const expected = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
       .update(`${body.razorpay_order_id}|${body.razorpay_payment_id}`).digest('hex');
     const expectedBuffer = Buffer.from(expected, 'hex');
@@ -293,18 +395,121 @@ app.post('/api/v1/payments/verify', requireAuth, async (req: AuthenticatedReques
     if (expectedBuffer.length !== receivedBuffer.length || !crypto.timingSafeEqual(expectedBuffer, receivedBuffer)) {
       return res.status(400).json({ message: 'Payment signature invalid' });
     }
-    const registration = await Registration.findOne({ _id: body.registrationId, userId: req.authUser?.id });
-    if (!registration) return res.status(404).json({ message: 'Registration not found' });
-    const payment = await Payment.findOne({ registrationId: registration._id, razorpayOrderId: body.razorpay_order_id });
+
+    const payment = await Payment.findOne({
+      registrationId: registration._id,
+      razorpayOrderId: body.razorpay_order_id
+    });
     if (!payment) return res.status(404).json({ message: 'Payment order not found' });
-    payment.razorpayPaymentId = body.razorpay_payment_id;
-    payment.signatureVerified = true;
-    payment.status = 'authorized';
-    await payment.save();
-    registration.paymentStatus = 'paid';
-    registration.status = 'confirmed';
-    await registration.save();
-    return res.json({ verified: true, registrationStatus: registration.status });
+    if (payment.razorpayPaymentId && payment.razorpayPaymentId !== body.razorpay_payment_id) {
+      return res.status(409).json({ message: 'Payment does not match this order' });
+    }
+
+    const reusedPayment = await Payment.findOne({ razorpayPaymentId: body.razorpay_payment_id });
+    if (reusedPayment && (
+      reusedPayment.registrationId.toString() !== registration.id ||
+      reusedPayment.razorpayOrderId !== body.razorpay_order_id
+    )) {
+      return res.status(409).json({ message: 'Payment ID is already associated with another registration' });
+    }
+
+    if (payment.amountPaise !== registration.amountPaise) {
+      return res.status(409).json({ message: 'Payment amount does not match registration' });
+    }
+
+    let razorpayOrder: any;
+    let razorpayPayment: any;
+    try {
+      const razorpay = getRazorpayClient();
+      [razorpayOrder, razorpayPayment] = await Promise.all([
+        razorpay.orders.fetch(body.razorpay_order_id),
+        razorpay.payments.fetch(body.razorpay_payment_id)
+      ]);
+    } catch {
+      return res.status(502).json({ message: 'Unable to verify payment with payment gateway' });
+    }
+
+    if (
+      razorpayOrder.id !== body.razorpay_order_id ||
+      Number(razorpayOrder.amount) !== registration.amountPaise ||
+      razorpayOrder.currency !== 'INR'
+    ) {
+      return res.status(409).json({ message: 'Payment order validation failed' });
+    }
+    if (
+      razorpayPayment.id !== body.razorpay_payment_id ||
+      razorpayPayment.order_id !== body.razorpay_order_id ||
+      Number(razorpayPayment.amount) !== registration.amountPaise ||
+      razorpayPayment.currency !== 'INR'
+    ) {
+      return res.status(409).json({ message: 'Payment validation failed' });
+    }
+
+    if (razorpayPayment.status === 'captured' && razorpayPayment.captured === true) {
+      await Payment.findOneAndUpdate(
+        { _id: payment._id },
+        {
+          $set: {
+            razorpayPaymentId: body.razorpay_payment_id,
+            signatureVerified: true,
+            status: 'captured',
+            amountPaise: registration.amountPaise
+          }
+        }
+      );
+      await Registration.findOneAndUpdate(
+        { _id: registration._id, paymentStatus: { $ne: 'paid' } },
+        { $set: { paymentStatus: 'paid', status: 'confirmed' } }
+      );
+      const updatedRegistration = await Registration.findById(registration._id);
+      return res.json({
+        verified: true,
+        registrationStatus: updatedRegistration?.status,
+        paymentStatus: updatedRegistration?.paymentStatus
+      });
+    }
+
+    if (razorpayPayment.status === 'authorized') {
+      await Payment.findOneAndUpdate(
+        { _id: payment._id },
+        {
+          $set: {
+            razorpayPaymentId: body.razorpay_payment_id,
+            signatureVerified: true,
+            status: 'authorized',
+            amountPaise: registration.amountPaise
+          }
+        }
+      );
+      return res.json({
+        verified: false,
+        registrationStatus: registration.status,
+        paymentStatus: registration.paymentStatus,
+        message: 'Payment is authorized but not yet captured'
+      });
+    }
+
+    await Payment.findOneAndUpdate(
+      { _id: payment._id },
+      {
+        $set: {
+          razorpayPaymentId: body.razorpay_payment_id,
+          signatureVerified: true,
+          status: 'failed',
+          amountPaise: registration.amountPaise
+        }
+      }
+    );
+    await Registration.findOneAndUpdate(
+      { _id: registration._id, paymentStatus: { $ne: 'paid' } },
+      { $set: { paymentStatus: 'failed', status: 'pending_payment' } }
+    );
+    return res.json({
+      verified: false,
+      registrationStatus: 'pending_payment',
+      paymentStatus: 'failed',
+      message: 'Payment was not successful'
+    });
   } catch (error) { return next(error); }
 });
 

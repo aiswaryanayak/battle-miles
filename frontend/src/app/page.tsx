@@ -116,6 +116,8 @@ const faqs = [
 export default function Home() {
   const [open, setOpen] = useState<number | null>(0);
   const [activeGoodie, setActiveGoodie] = useState(0);
+  const [authUser,setAuthUser]=useState<{role:'participant'|'admin'}|null>(null);
+  const [welcomeMessage,setWelcomeMessage]=useState('');
 
   useEffect(() => {
     const interval = window.setInterval(() => {
@@ -124,6 +126,23 @@ export default function Home() {
 
     return () => window.clearInterval(interval);
   }, []);
+
+  useEffect(()=>{
+    fetch(`${process.env.NEXT_PUBLIC_API_URL||'http://localhost:4000/api/v1'}/auth/me`,{credentials:'include'})
+      .then(response=>response.ok?response.json():null)
+      .then(result=>setAuthUser(result?.user?{role:result.user.role}:null))
+      .catch(()=>setAuthUser(null));
+  },[]);
+
+  useEffect(()=>{
+    const params=new URLSearchParams(location.search);
+    if(params.get('welcome')==='1'){
+      setWelcomeMessage('Welcome to BATTLE MILES! Your account is ready.');
+      params.delete('welcome');
+      const remaining=params.toString();
+      window.history.replaceState({},'',`${location.pathname}${remaining?`?${remaining}`:''}`);
+    }
+  },[]);
 
   const showPrevious = () => {
     setActiveGoodie((current) => (current - 1 + goodies.length) % goodies.length);
@@ -150,11 +169,23 @@ export default function Home() {
             <a className="navlink" href="#how">How it works</a>
             <a className="navlink" href="#faq">FAQ</a>
           </nav>
-          <a href="/register" className="btn btn-lime">
-            Register now <ArrowUpRight size={16} />
-          </a>
+          <div className="flex items-center gap-2">
+            <a href="/register" className="btn btn-lime">Register now <ArrowUpRight size={16} /></a>
+            {authUser?.role==='participant'&&<a href="/dashboard" className="btn btn-lime">Dashboard</a>}
+            {authUser?.role==='admin'&&<a href="/admin" className="btn btn-lime">Admin</a>}
+            {!authUser&&<>
+              <a href="/login" className="btn border border-white/40 text-white">Login</a>
+              <a href="/signup" className="btn btn-lime">Create account</a>
+            </>}
+          </div>
         </div>
       </header>
+
+      {welcomeMessage&&authUser?.role==='participant'&&
+        <div role="status" className="fixed z-40 right-5 bottom-5 max-w-sm rounded-xl bg-[#D9F36A] px-5 py-4 text-sm font-bold text-[#101820] shadow-xl">
+          {welcomeMessage}
+        </div>
+      }
 
       <section className="relative min-h-[690px] md:min-h-[760px] flex items-center text-white overflow-hidden bg-[#07152f]">
         <div
