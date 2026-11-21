@@ -52,8 +52,125 @@ app.use(cors({
   },
   credentials: true
 }));
-app.use(express.json({ limit: '1mb' }));
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, limit: 250 }));
+app.post('/api/v1/payments/webhook', express.raw({ type: 'application/json', limit: '1mb' }), async (req, res) => {
+  const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
+  if (!webhookSecret) return res.status(503).json({ message: 'Webhook is not configured' });
+
+  const signature = req.get('x-razorpay-signature');
+  if (!signature || !/^[a-f\d]{64}$/i.test(signature) || !Buffer.isBuffer(req.body)) {
+    return res.status(400).json({ message: 'Invalid webhook signature' });
+  }
+
+  const expected = crypto.createHmac('sha256', webhookSecret).update(req.body).digest('hex');
+  const expectedBuffer = Buffer.from(expected, 'hex');
+  const receivedBuffer = Buffer.from(signature, 'hex');
+  if (expectedBuffer.length !== receivedBuffer.length || !crypto.timingSafeEqual(expectedBuffer, receivedBuffer)) {
+    return res.status(400).json({ message: 'Invalid webhook signature' });
+  }
+
+  let payload: any;
+  try {
+    payload = JSON.parse(req.body.toString('utf8'));
+  } catch {
+    return res.status(400).json({ message: 'Invalid webhook payload' });
+  }
+
+  if (payload?.event !== 'payment.captured' && payload?.event !== 'payment.failed') {
+    return res.status(200).json({ received: true });
+  }
+
+  const entity = payload?.payload?.payment?.entity;
+  if (
+    !entity ||
+    typeof entity.id !== 'string' ||
+    typeof entity.order_id !== 'string' ||
+    typeof entity.amount !== 'number' ||
+    typeof entity.currency !== 'string'
+  ) {
+    return res.status(400).json({ message: 'Invalid webhook payload' });
+  }
+
+  try {
+    const payment = await Payment.findOne({ razorpayOrderId: entity.order_id });
+    if (!payment) return res.status(404).json({ message: 'Payment order not found' });
+
+    if (
+      payment.razorpayPaymentId &&
+      payment.razorpayPaymentId !== entity.id
+    ) {
+      return res.status(409).json({ message: 'Payment does not match this order' });
+    }
+
+    const reusedPayment = await Payment.findOne({ razorpayPaymentId: entity.id });
+    if (
+      reusedPayment &&
+      (
+        reusedPayment.id !== payment.id ||
+        reusedPayment.razorpayOrderId !== entity.order_id
+      )
+    ) {
+      return res.status(409).json({ message: 'Payment ID is already associated with another registration' });
+    }
+
+    const registration = await Registration.findById(payment.registrationId);
+    if (!registration) return res.status(404).json({ message: 'Registration not found' });
+    if (
+      payment.amountPaise !== registration.amountPaise ||
+      entity.amount !== payment.amountPaise ||
+      entity.currency !== 'INR' ||
+      registration.currency !== 'INR'
+    ) {
+      return res.status(409).json({ message: 'Payment amount or currency mismatch' });
+    }
+
+    if (payload.event === 'payment.captured') {
+      if (entity.status !== 'captured' || entity.captured !== true) {
+        return res.status(409).json({ message: 'Payment is not captured' });
+      }
+      await Payment.findOneAndUpdate(
+        { _id: payment._id },
+        {
+          $set: {
+            razorpayPaymentId: entity.id,
+            signatureVerified: true,
+            status: 'captured',
+            amountPaise: registration.amountPaise
+          }
+        }
+      );
+      await Registration.findOneAndUpdate(
+        { _id: registration._id, paymentStatus: { $ne: 'paid' } },
+        { $set: { paymentStatus: 'paid', status: 'confirmed' } }
+      );
+      return res.status(200).json({ received: true });
+    }
+
+    if (payment.status === 'captured' || registration.paymentStatus === 'paid') {
+      return res.status(200).json({ received: true });
+    }
+
+    await Payment.findOneAndUpdate(
+      { _id: payment._id },
+      {
+        $set: {
+          razorpayPaymentId: entity.id,
+          signatureVerified: false,
+          status: 'failed',
+          amountPaise: registration.amountPaise
+        }
+      }
+    );
+    await Registration.findOneAndUpdate(
+      { _id: registration._id, paymentStatus: { $ne: 'paid' } },
+      { $set: { paymentStatus: 'failed', status: 'pending_payment' } }
+    );
+    return res.status(200).json({ received: true });
+  } catch {
+    return res.status(500).json({ message: 'Unable to reconcile payment webhook' });
+  }
+});
+app.use(express.json({ limit: '1mb' }));
 
 if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32) {
   throw new Error('SESSION_SECRET must be at least 32 characters long');

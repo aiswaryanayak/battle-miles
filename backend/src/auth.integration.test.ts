@@ -89,6 +89,30 @@ const suite = describe('authentication integration', () => {
       .digest('hex');
   }
 
+  function webhookSignature(body: string): string {
+    return crypto.createHmac('sha256', process.env.RAZORPAY_WEBHOOK_SECRET!)
+      .update(body)
+      .digest('hex');
+  }
+
+  function webhookPayload(event: 'payment.captured' | 'payment.failed', orderId: string, paymentId: string, amount: number, currency = 'INR') {
+    return JSON.stringify({
+      event,
+      payload: {
+        payment: {
+          entity: {
+            id: paymentId,
+            order_id: orderId,
+            amount,
+            currency,
+            status: event === 'payment.captured' ? 'captured' : 'failed',
+            captured: event === 'payment.captured'
+          }
+        }
+      }
+    });
+  }
+
   async function getSessionIdsForUsers(userIds: string[]): Promise<string[]> {
     const rows = await mongoose.connection.collection<{ _id: string; session: string }>('sessions').find({}).toArray();
     return rows
@@ -110,6 +134,7 @@ const suite = describe('authentication integration', () => {
     process.env.FRONTEND_ORIGIN = 'http://localhost:3000';
     process.env.RAZORPAY_KEY_ID = 'rzp_test_battle_miles';
     process.env.RAZORPAY_KEY_SECRET = 'battle_miles_test_secret';
+    process.env.RAZORPAY_WEBHOOK_SECRET = 'battle_miles_test_webhook_secret';
     ({ app, closeSessionStore } = await import('./server'));
     ({ connectDatabase, disconnectDatabase } = await import('./config/db'));
     ({ setRazorpayClientFactoryForTests, resetRazorpayClientFactory } = await import('./config/razorpay'));
@@ -761,6 +786,177 @@ const suite = describe('authentication integration', () => {
     assert.equal(updatedRegistration?.paymentStatus, 'paid');
     assert.equal(updatedRegistration?.status, 'confirmed');
     assert.equal(updatedPayment?.status, 'captured');
+  });
+
+  it('reconciles a valid captured webhook and is duplicate-safe', async () => {
+    const registration = await createPaymentRegistration('05');
+    const orderId = `order_webhook_captured_${runId}`;
+    const paymentId = `pay_webhook_captured_${runId}`;
+    await Payment.create({
+      registrationId: registration._id,
+      razorpayOrderId: orderId,
+      amountPaise: 80000,
+      status: 'created'
+    });
+    const body = webhookPayload('payment.captured', orderId, paymentId, 80000);
+    const response = await request('/payments/webhook', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-razorpay-signature': webhookSignature(body)
+      },
+      body
+    });
+    assert.equal(response.response.status, 200);
+
+    const duplicate = await request('/payments/webhook', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-razorpay-signature': webhookSignature(body)
+      },
+      body
+    });
+    assert.equal(duplicate.response.status, 200);
+
+    const updatedRegistration = await Registration.findById(registration.id);
+    const updatedPayment = await Payment.findOne({ razorpayOrderId: orderId });
+    assert.equal(updatedRegistration?.paymentStatus, 'paid');
+    assert.equal(updatedRegistration?.status, 'confirmed');
+    assert.equal(updatedPayment?.status, 'captured');
+    assert.equal(updatedPayment?.razorpayPaymentId, paymentId);
+  });
+
+  it('rejects invalid webhook signatures and invalid payloads', async () => {
+    const invalidSignatureBody = webhookPayload(
+      'payment.captured',
+      `order_webhook_invalid_signature_${runId}`,
+      `pay_webhook_invalid_signature_${runId}`,
+      80000
+    );
+    const invalidSignature = await request('/payments/webhook', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-razorpay-signature': '0'.repeat(64)
+      },
+      body: invalidSignatureBody
+    });
+    assert.equal(invalidSignature.response.status, 400);
+
+    const invalidPayloadBody = JSON.stringify({
+      event: 'payment.captured',
+      payload: { payment: { entity: { id: `pay_invalid_payload_${runId}` } } }
+    });
+    const invalidPayload = await request('/payments/webhook', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-razorpay-signature': webhookSignature(invalidPayloadBody)
+      },
+      body: invalidPayloadBody
+    });
+    assert.equal(invalidPayload.response.status, 400);
+  });
+
+  it('reconciles failed webhooks and does not downgrade captured payments', async () => {
+    const failedRegistration = await createPaymentRegistration('10');
+    const failedOrderId = `order_webhook_failed_${runId}`;
+    const failedPaymentId = `pay_webhook_failed_${runId}`;
+    await Payment.create({
+      registrationId: failedRegistration._id,
+      razorpayOrderId: failedOrderId,
+      amountPaise: 120000,
+      status: 'created'
+    });
+    const failedBody = webhookPayload('payment.failed', failedOrderId, failedPaymentId, 120000);
+    const failedResponse = await request('/payments/webhook', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-razorpay-signature': webhookSignature(failedBody)
+      },
+      body: failedBody
+    });
+    assert.equal(failedResponse.response.status, 200);
+    const failedRegistrationUpdated = await Registration.findById(failedRegistration.id);
+    const failedPaymentUpdated = await Payment.findOne({ razorpayOrderId: failedOrderId });
+    assert.equal(failedRegistrationUpdated?.paymentStatus, 'failed');
+    assert.equal(failedPaymentUpdated?.status, 'failed');
+
+    const capturedRegistration = await createPaymentRegistration('20');
+    const capturedOrderId = `order_webhook_after_capture_${runId}`;
+    const capturedPaymentId = `pay_webhook_after_capture_${runId}`;
+    await Payment.create({
+      registrationId: capturedRegistration._id,
+      razorpayOrderId: capturedOrderId,
+      amountPaise: 150000,
+      status: 'captured',
+      razorpayPaymentId: capturedPaymentId,
+      signatureVerified: true
+    });
+    await Registration.findByIdAndUpdate(capturedRegistration.id, {
+      $set: { paymentStatus: 'paid', status: 'confirmed' }
+    });
+    const lateFailedBody = webhookPayload('payment.failed', capturedOrderId, capturedPaymentId, 150000);
+    const lateFailed = await request('/payments/webhook', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-razorpay-signature': webhookSignature(lateFailedBody)
+      },
+      body: lateFailedBody
+    });
+    assert.equal(lateFailed.response.status, 200);
+    const capturedRegistrationUpdated = await Registration.findById(capturedRegistration.id);
+    const capturedPaymentUpdated = await Payment.findOne({ razorpayOrderId: capturedOrderId });
+    assert.equal(capturedRegistrationUpdated?.paymentStatus, 'paid');
+    assert.equal(capturedRegistrationUpdated?.status, 'confirmed');
+    assert.equal(capturedPaymentUpdated?.status, 'captured');
+  });
+
+  it('rejects mismatched order and payment webhooks', async () => {
+    const registration = await createPaymentRegistration('05');
+    const orderId = `order_webhook_mismatch_${runId}`;
+    const existingPaymentId = `pay_webhook_existing_${runId}`;
+    await Payment.create({
+      registrationId: registration._id,
+      razorpayOrderId: orderId,
+      razorpayPaymentId: existingPaymentId,
+      amountPaise: 80000,
+      status: 'created'
+    });
+    const mismatchedBody = webhookPayload(
+      'payment.captured',
+      orderId,
+      `pay_webhook_mismatched_${runId}`,
+      80000
+    );
+    const mismatched = await request('/payments/webhook', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-razorpay-signature': webhookSignature(mismatchedBody)
+      },
+      body: mismatchedBody
+    });
+    assert.equal(mismatched.response.status, 409);
+
+    const mismatchAmountBody = webhookPayload(
+      'payment.captured',
+      orderId,
+      existingPaymentId,
+      79999
+    );
+    const mismatchAmount = await request('/payments/webhook', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-razorpay-signature': webhookSignature(mismatchAmountBody)
+      },
+      body: mismatchAmountBody
+    });
+    assert.equal(mismatchAmount.response.status, 409);
   });
 
   it('checks roles from the database for protected endpoints', async () => {
